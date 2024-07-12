@@ -1,3 +1,4 @@
+use std::process::exit;
 use clap::{arg, Command};
 
 fn main() {
@@ -40,6 +41,9 @@ fn main() {
             println!("Remove {}", key);
             unimplemented!();
         },
-        _ => eprintln!("Use {} -h for help", env!("CARGO_PKG_NAME")),
+        _ => {
+            eprintln!("Use {} -h for help", env!("CARGO_PKG_NAME"));
+            exit(1);
+        },
     }
 }
