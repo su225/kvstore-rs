@@ -1,7 +1,25 @@
+#![deny(missing_docs)]
 use std::collections::HashMap;
 
 /// The `KVStore` represents a simple in-memory key value pair.
 /// It does not store anything on the disk yet.
+///
+/// ```rust
+/// use kvstore_rs::KVStore;
+/// let mut kv_store = KVStore::new();
+///
+/// // add the key value pair and query it
+/// kv_store.set("foo".to_owned(), "bar".to_owned());
+/// assert_eq!(kv_store.get("foo".to_owned()), Some("bar".to_owned()));
+///
+/// // query a non-existing key
+/// assert_eq!(kv_store.get("jaz".to_owned()), None);
+///
+/// // remove the key added and query
+/// kv_store.remove("foo".to_owned());
+/// assert_eq!(kv_store.get("foo".to_owned()), None);
+///
+/// ```
 #[derive(Default)]
 pub struct KVStore {
     kv: HashMap<String, String>,
