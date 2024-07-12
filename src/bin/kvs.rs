@@ -26,20 +26,20 @@ fn main() {
 
     match matches.subcommand() {
         Some(("set", sub_m)) => {
-            let key = sub_m.get_one::<String>("KEY").unwrap();
-            let value = sub_m.get_one::<String>("VALUE").unwrap();
-            println!("Set {} to {}", key, value);
-            unimplemented!();
+            let _key = sub_m.get_one::<String>("KEY").unwrap();
+            let _value = sub_m.get_one::<String>("VALUE").unwrap();
+            eprintln!("unimplemented");
+            exit(1);
         },
         Some(("get", sub_m)) => {
-            let key = sub_m.get_one::<String>("KEY").unwrap();
-            println!("Get {}", key);
-            unimplemented!();
+            let _key = sub_m.get_one::<String>("KEY").unwrap();
+            eprintln!("unimplemented");
+            exit(1);
         },
         Some(("rm", sub_m)) => {
-            let key = sub_m.get_one::<String>("KEY").unwrap();
-            println!("Remove {}", key);
-            unimplemented!();
+            let _key = sub_m.get_one::<String>("KEY").unwrap();
+            eprintln!("unimplemented");
+            exit(1);
         },
         _ => {
             eprintln!("Use {} -h for help", env!("CARGO_PKG_NAME"));
