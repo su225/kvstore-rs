@@ -3,7 +3,7 @@ use clap::{arg, Command};
 fn main() {
     let matches = Command::new("kvstore-rs")
         .version(env!("CARGO_PKG_VERSION"))
-        .author(env!("CARGO_PKG_AUTHOR"))
+        .author(env!("CARGO_PKG_AUTHORS"))
         .about(env!("CARGO_PKG_DESCRIPTION"))
         .subcommand(
             Command::new("set")
