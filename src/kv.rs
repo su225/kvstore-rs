@@ -1,57 +1,24 @@
 #![deny(missing_docs)]
-use std::collections::HashMap;
-use std::path::Path;
-
 use crate::error::Result;
 
-/// The `KVStore` represents a simple in-memory key value pair.
-/// It does not store anything on the disk yet.
-///
-/// ```rust
-/// use kvstore_rs::KVStore;
-/// let mut kv_store = KVStore::new();
-///
-/// // add the key value pair and query it
-/// kv_store.set("foo".to_owned(), "bar".to_owned());
-/// assert_eq!(kv_store.get("foo".to_owned()), Some("bar".to_owned()));
-///
-/// // query a non-existing key
-/// assert_eq!(kv_store.get("jaz".to_owned()), None);
-///
-/// // remove the key added and query
-/// kv_store.remove("foo".to_owned());
-/// assert_eq!(kv_store.get("foo".to_owned()), None);
-///
-/// ```
-#[derive(Default)]
-pub struct KVStore {
-    kv: HashMap<String, String>,
-}
+/// `KVStore` represents the basic key-value store implementation
+pub trait KVStore {
+    /// `Key` is the type of the key
+    type Key;
 
-impl KVStore {
-    /// Open creates a new `KVStore` instance with the
-    /// data defined in the `data_directory`.
-    pub fn open(data_directory: &Path) -> Result<KVStore> {
-        unimplemented!()
-    }
+    /// `Value` is the type of the value
+    type Value;
 
-    /// Sets the value for the given `key` to the `value`.
-    /// If the key already exists, then the value is overwritten
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
-        self.kv.insert(key, value);
-        Ok(())
-    }
+    /// `get` returns the key of type Key when it exists or None otherwise.
+    /// If there is an error while fetching the key, it is reported as Err.
+    fn get(&self, key: Self::Key) -> Result<Option<Self::Value>>;
 
-    /// Get returns the `value` for the `key` if it exists.
-    /// Otherwise, it returns None
-    pub fn get(&self, key: String) -> Result<Option<String>> {
-        Ok(self.kv.get(&key).cloned())
-    }
+    /// `set` sets the value of the given key to the given value. If the key
+    /// already exists then the value is replaced. If there is any error while
+    /// setting the value of the key, then it is returned as an Err.
+    fn set(&mut self, key: Self::Key, value: Self::Value) -> Result<()>;
 
-    /// Removes a given key. If the key does not exist,
-    /// then this is a no-op
-    pub fn remove(&mut self, key: String) -> Result<()> {
-        self.kv.remove(&key);
-        Ok(())
-    }
+    /// `remove` removes the value of the given key if it exists, or it is a no-op.
+    /// If there was any error while removing the key, then it is reported.
+    fn remove(&mut self, key: Self::Key) -> Result<()>;
 }
