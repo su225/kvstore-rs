@@ -1,3 +1,5 @@
+//! Defines interface for pluggable key-value store interface
+
 #![deny(missing_docs)]
 use crate::error::Result;
 
