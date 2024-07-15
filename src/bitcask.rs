@@ -7,10 +7,13 @@
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use failure::format_err;
 use glob::glob;
+use serde_derive::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::kv::KVStore;
@@ -18,7 +21,8 @@ use crate::kv::KVStore;
 const X25: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC);
 
 /// `StoreCommand` specifies the operation on a key.
-#[derive(Debug, Clone)]
+#[repr(C)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 enum StoreCommand {
     Set(String),
     Remove,
@@ -27,12 +31,13 @@ enum StoreCommand {
 /// `BitcaskEntry` represents a single entry in a bitcask data file.
 /// The entries are sorted by timestamp and the value depends on the
 /// command specified.
-#[derive(Debug, Clone)]
+#[repr(C, packed)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BitcaskEntry {
     crc: u16,
     ts: u128,
-    ksz: u32,
-    vsz: u32,
+    ksz: u64,
+    vsz: u64,
     key: String,
     value: StoreCommand,
 }
@@ -40,7 +45,8 @@ struct BitcaskEntry {
 /// `BitcaskHintEntry` represents a single entry in a bitcask hint file.
 /// The entries are sorted by timestamp and are there to aid quick recovery
 /// of the bitcask store after a restart.
-#[derive(Debug, Clone)]
+#[repr(C, packed)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct BitcaskHintEntry {
     ts: u128,
     ksz: u32,
@@ -58,11 +64,12 @@ impl BitcaskEntry {
     }
 }
 
+#[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct BitcaskPtr {
-    file_id: u128,
-    vsz: u32,
-    vpos: usize,
+    file_id: u32,
+    vsz: u64,
+    vpos: u64,
     ts: u128,
 }
 
@@ -178,7 +185,37 @@ impl BitcaskStore {
     }
 
     fn append_command_to_store(&mut self, key: &str, cmd: StoreCommand) -> Result<BitcaskPtr> {
-        todo!()
+        let cur_ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let key = bincode::serialize(key)?;
+        let val = bincode::serialize(&cmd)?;
+
+        let cur_ts_bytes = cur_ts.to_be_bytes();
+        let key_size_bytes = (key.len() as u64).to_be_bytes();
+        let val_size_bytes = (val.len() as u64).to_be_bytes();
+
+        let mut digest = X25.digest();
+        digest.update(&*cur_ts_bytes);
+        digest.update(&*key_size_bytes);
+        digest.update(&*val_size_bytes);
+        digest.update(key.as_ref());
+        digest.update(val.as_ref());
+        let crc = digest.finalize().to_be_bytes();
+
+        let mut v_offset = 0;
+        let mut cur_file = self.current_open_file.as_mut().unwrap();
+        v_offset += cur_file.write(&*crc)?;
+        v_offset += cur_file.write(&*cur_ts_bytes)?;
+        v_offset += cur_file.write(&*key_size_bytes)?;
+        v_offset += cur_file.write(&*val_size_bytes)?;
+        v_offset += cur_file.write(key.as_ref())?;
+        cur_file.write_all(val.as_ref())?;
+
+        Ok(BitcaskPtr{
+            file_id: self.current_serial_number,
+            vsz: val.len() as u64,
+            vpos: v_offset as u64,
+            ts: cur_ts,
+        })
     }
 
     fn update_key_directory(&mut self, key: String, bitcask_ptr: BitcaskPtr) {
