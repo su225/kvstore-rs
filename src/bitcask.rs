@@ -4,16 +4,17 @@
 
 #![deny(missing_docs)]
 
+use std::borrow::{Borrow, BorrowMut};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::borrow::{Borrow, BorrowMut};
-use std::io::Write;
+use std::io::{Cursor, Read, Write};
+use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use failure::format_err;
+use failure::{Error, format_err};
 use glob::glob;
 use serde_derive::{Deserialize, Serialize};
 
@@ -21,7 +22,8 @@ use crate::error::Result;
 use crate::kv::KVStore;
 
 const X25: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC);
-const BITCASK_HEADER_SIZE: u64 = 34;
+const BITCASK_HEADER_SIZE: u64 = size_of::<BitcaskHeader>() as u64;
+const BITCASK_HINT_HEADER_SIZE: usize = size_of::<BitcaskHintHeader>();
 const BITCASK_DATA_EXTENSION: &'static str = "caskdata";
 const BITCASK_HINT_EXTENSION: &'static str = "caskhint";
 
@@ -56,6 +58,7 @@ struct BitcaskHeader {
 /// bytes and try to interpret it as UTF-8 to recover key and values.
 /// We then verify the entire output from `ts` all the way to the
 /// end of `val` with the given `crc` to check for corruption.
+#[repr(C)]
 #[derive(Serialize, Deserialize)]
 struct BitcaskEntry {
     header: BitcaskHeader,
@@ -63,24 +66,53 @@ struct BitcaskEntry {
     value: StoreCommand,
 }
 
-/// `BitcaskHintEntry` represents a single entry in a bitcask hint file.
-/// The entries are sorted by timestamp and are there to aid quick recovery
-/// of the bitcask store after a restart.
-#[derive(Serialize, Deserialize)]
-struct BitcaskHintEntry {
-    ts: u128,
-    ksz: u32,
-    vsz: u32,
-    vpos: u64,
-    key: String,
-}
-
 impl BitcaskEntry {
+    fn parse_keydir_entry(cursor: &mut Cursor<impl AsRef<[u8]>>) -> Result<(BitcaskHeader, String, u64)> {
+        todo!()
+    }
+
     fn get_value(&self) -> Option<String> {
         match &self.value {
             StoreCommand::Remove => None,
             StoreCommand::Set(ref val) => Some(val.clone()),
         }
+    }
+}
+
+/// `BitcaskHintHeader` represents the header for the Bitcask hint.
+/// The hint is used to quickly recover the in-memory key directory
+/// structure. It does not contain the value which means that it is
+/// smaller than the data file and hence fewer I/Os on startup.
+#[repr(C, packed)]
+#[derive(Serialize, Deserialize)]
+struct BitcaskHintHeader {
+    ts: u128,
+    ksz: u32,
+    vsz: u64,
+    vpos: u64,
+}
+
+/// `BitcaskHintEntry` represents a single entry in a bitcask hint file.
+/// The entries are sorted by timestamp and are there to aid quick recovery
+/// of the bitcask store after a restart.
+#[repr(C)]
+#[derive(Serialize, Deserialize)]
+struct BitcaskHintEntry {
+    header: BitcaskHintHeader,
+    key: String,
+}
+
+impl BitcaskHintEntry {
+    fn parse_from(cursor: &mut Cursor<impl AsRef<[u8]>>) -> Result<Self> {
+        let mut hint_header = [0_u8; BITCASK_HINT_HEADER_SIZE];
+        cursor.read_exact(&mut hint_header[..])?;
+        let header: BitcaskHintHeader = bincode::deserialize(&hint_header)?;
+
+        let mut key_buffer = Vec::with_capacity(header.ksz as usize);
+        cursor.read_exact(&mut key_buffer[..])?;
+
+        let key = String::from_utf8(key_buffer).map_err(|e| Error::from(e))?;
+        Ok(BitcaskHintEntry{ header, key })
     }
 }
 
@@ -143,7 +175,7 @@ impl BitcaskStore {
                     match sr_num {
                         Some(cur_serial_number) => {
                             max_serial_number = max(max_serial_number, cur_serial_number);
-                            self.recover_from_hint_file(&hint_file)?;
+                            self.recover_from_hint_file(cur_serial_number, &hint_file)?;
                             already_processed.insert(cur_serial_number);
                         },
                         None => { return Err(format_err!("invalid hint filename format for {}", hint_file.display())); }
@@ -168,7 +200,7 @@ impl BitcaskStore {
                                 continue;
                             }
                             max_serial_number = max(max_serial_number, cur_serial_number);
-                            self.recover_from_data_file(&data_file)?;
+                            self.recover_from_data_file(cur_serial_number, &data_file)?;
                             already_processed.insert(cur_serial_number);
                         },
                         None => { return Err(format_err!("invalid data filename format for {}", data_file.display())); }
@@ -192,12 +224,36 @@ impl BitcaskStore {
         Ok(())
     }
 
-    fn recover_from_hint_file(&mut self, path: &PathBuf) -> Result<()> {
-        todo!()
+    fn recover_from_hint_file(&mut self, hint_file_id: u32, path: &PathBuf) -> Result<()> {
+        let contents = std::fs::read(path)?;
+        let mut cursor = Cursor::new(&contents);
+        while cursor.position() < contents.len() as u64 {
+            let bitcask_hint = BitcaskHintEntry::parse_from(&mut cursor)?;
+            let bitcask_ptr = BitcaskPtr{
+                file_id: hint_file_id,
+                vsz: bitcask_hint.header.vsz,
+                vpos: bitcask_hint.header.vpos,
+                ts: bitcask_hint.header.ts,
+            };
+            self.update_key_directory(bitcask_hint.key, bitcask_ptr);
+        }
+        Ok(())
     }
 
-    fn recover_from_data_file(&mut self, path: &PathBuf) -> Result<()> {
-        todo!()
+    fn recover_from_data_file(&mut self, data_file_id: u32, path: &PathBuf) -> Result<()> {
+        let contents = std::fs::read(path)?;
+        let mut cursor = Cursor::new(&contents);
+        while cursor.position() < contents.len() as u64 {
+            let (bitcask_header, bitcask_key, vpos) = BitcaskEntry::parse_keydir_entry(&mut cursor)?;
+            let bitcask_ptr = BitcaskPtr{
+                file_id: data_file_id,
+                vsz: bitcask_header.vsz,
+                ts: bitcask_header.ts,
+                vpos,
+            };
+            self.update_key_directory(bitcask_key, bitcask_ptr)
+        }
+        Ok(())
     }
 
     fn fetch_value(&self, key: &str, bitcask_ptr: BitcaskPtr) -> Result<String> {
@@ -209,25 +265,28 @@ impl BitcaskStore {
         self.load_entry_from_datafile(bitcask_ptr.file_id, entry_offset)
     }
 
+    // Loads entry from the data file for a given bitcask pointer and file_id.
+    // TODO: cache file handles to avoid opening repeatedly. Currently, it is inefficient
+    // TODO: cache the entries so that repeated disk seeks can be avoided.
+    // TODO: implement CRC checks to ensure data integrity.
     fn load_entry_from_datafile(&self, file_id: u32, entry_offset: u64) -> Result<String> {
-        // TODO: cache file handles to avoid opening repeatedly
         let datafile_name = format!("{}.{}", file_id, BITCASK_DATA_EXTENSION);
         let mut file_handle = File::open(datafile_name)?;
 
         let mut entry_header_bytes = [0_u8; BITCASK_HEADER_SIZE as usize];
         file_handle.read_exact_at(entry_header_bytes.borrow_mut(), entry_offset)?;
-
         let entry_header: BitcaskHeader = bincode::deserialize(entry_header_bytes.borrow())?;
+
         let val_offset = entry_offset + BITCASK_HEADER_SIZE + entry_header.ksz;
         let mut val_buffer = Vec::with_capacity(entry_header.vsz as usize);
 
         file_handle.read_exact_at(val_buffer.as_mut(), val_offset)?;
-        match String::from_utf8(val_buffer) {
-            Ok(val) => Ok(val),
-            Err(e) => Err(e.into()),
-        }
+        String::from_utf8(val_buffer).map_err(|e| e.into())
     }
 
+    /// Appends the command to the store. The command acts as a write-ahead logging
+    /// system of the data store. The commands are written to the disk and are used
+    /// to recover the state of the store on startup.
     fn append_command_to_store(&mut self, key: &str, cmd: StoreCommand) -> Result<BitcaskPtr> {
         let cur_ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let key = bincode::serialize(key)?;
@@ -262,10 +321,18 @@ impl BitcaskStore {
         })
     }
 
+    /// Updates the key directory with the bitcask pointer for the given key.
+    /// The bitcask pointer is an on-disk pointer to some piece of data. This
+    /// is called on inserting/updating some data into the store or during the
+    /// recovery after the restart.
     fn update_key_directory(&mut self, key: String, bitcask_ptr: BitcaskPtr) {
         self.key_dir.insert(key, bitcask_ptr);
     }
 
+    /// Removes entry from the in-memory key directory. This is called on
+    /// removing an entry from the store. The corresponding action on disk
+    /// would be writing a `StoreCommand::Remove` which is effectively a
+    /// tombstone on the disk. During the merge, the removal is enforced.
     fn remove_entry_from_key_directory(&mut self, key: String) {
         self.key_dir.remove(&key);
     }
