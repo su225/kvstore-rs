@@ -5,9 +5,10 @@
 #![deny(missing_docs)]
 
 use std::borrow::{Borrow, BorrowMut};
-use std::cmp::max;
-use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::fmt::{Display, Formatter};
+use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileExt;
@@ -24,13 +25,97 @@ use crate::kv::KVStore;
 const X25: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC);
 const BITCASK_HEADER_SIZE: u64 = size_of::<BitcaskHeader>() as u64;
 const BITCASK_HINT_HEADER_SIZE: usize = size_of::<BitcaskHintHeader>();
+
+// Extensions of files in cask data directory
 const BITCASK_DATA_EXTENSION: &'static str = "caskdata";
 const BITCASK_HINT_EXTENSION: &'static str = "caskhint";
+const BITCASK_WRITING_EXTENSION: &'static str = "caskwriting";
 
-/// `StoreCommand` specifies the operation on a key.
+#[derive(Debug, Eq, PartialEq, Hash)]
+enum BitcaskFileType {
+    Data,
+    Hint,
+    WriteInProgress,
+}
+
+impl BitcaskFileType {
+    fn extension(&self) -> &'static str {
+        match self {
+            BitcaskFileType::Data => BITCASK_DATA_EXTENSION,
+            BitcaskFileType::Hint => BITCASK_HINT_EXTENSION,
+            BitcaskFileType::WriteInProgress => BITCASK_WRITING_EXTENSION,
+        }
+    }
+}
+
+impl TryFrom<&'_ str> for BitcaskFileType {
+    type Error = Error;
+
+    fn try_from(extension: &'_ str) -> Result<Self> {
+        match extension {
+            BITCASK_DATA_EXTENSION => Ok(BitcaskFileType::Data),
+            BITCASK_HINT_EXTENSION => Ok(BitcaskFileType::Hint),
+            BITCASK_WRITING_EXTENSION => Ok(BitcaskFileType::WriteInProgress),
+            extension => Err(format_err!("unknown extension: {}", extension)),
+        }
+    }
+}
+
+impl Display for BitcaskFileType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.extension())
+    }
+}
+
+/// `BitcaskFileIdentifier` is the structured representation of a filename
+/// related to Bitcask.
+#[derive(Debug, Eq, PartialEq, Hash)]
+struct BitcaskFileIdentifier {
+    filetype: BitcaskFileType,
+    serial_number: u32,
+    create_timestamp: u128,
+}
+
+impl TryFrom<PathBuf> for BitcaskFileIdentifier {
+    type Error = Error;
+
+    fn try_from(path: PathBuf) -> Result<Self> {
+        if path.is_dir() {
+            return Err(format_err!("must not be a directory"));
+        }
+        let filename: &str = path.file_name()
+            .map(OsStr::to_str)
+            .flatten()
+            .ok_or(format_err!("cannot get filename"))?;
+        Self::try_from(filename)
+    }
+}
+
+impl TryFrom<&'_ str> for BitcaskFileIdentifier {
+    type Error = Error;
+
+    fn try_from(filename: &'_ str) -> std::result::Result<Self, Self::Error> {
+        let file_parts: Vec<&'_ str> = filename.splitn(3, ".").collect();
+        if file_parts.len() != 3 {
+            return Err(format_err!("invalid filename pattern"));
+        }
+        let serial_number = file_parts[0].parse::<u32>().map_err(|e| Error::from(e))?;
+        let create_timestamp = file_parts[1].parse::<u128>().map_err(|e| Error::from(e))?;
+        let filetype = BitcaskFileType::try_from(file_parts[2])?;
+        Ok(BitcaskFileIdentifier{serial_number, create_timestamp, filetype })
+    }
+}
+
+impl Display for BitcaskFileIdentifier {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.serial_number, self.create_timestamp, self.filetype.extension())
+    }
+}
+
+/// `BitcaskStoreCommand` specifies the operation on a key.
 #[repr(C)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum StoreCommand {
+enum BitcaskStoreCommand {
     Set(String),
     Remove,
 }
@@ -63,7 +148,7 @@ struct BitcaskHeader {
 struct BitcaskEntry {
     header: BitcaskHeader,
     key: String,
-    value: StoreCommand,
+    value: BitcaskStoreCommand,
 }
 
 impl BitcaskEntry {
@@ -73,8 +158,8 @@ impl BitcaskEntry {
 
     fn get_value(&self) -> Option<String> {
         match &self.value {
-            StoreCommand::Remove => None,
-            StoreCommand::Set(ref val) => Some(val.clone()),
+            BitcaskStoreCommand::Remove => None,
+            BitcaskStoreCommand::Set(ref val) => Some(val.clone()),
         }
     }
 }
@@ -159,68 +244,28 @@ impl BitcaskStore {
     }
 
     fn recover_from_disk(&mut self) -> Result<()> {
-        let mut max_serial_number = 0;
-        let mut already_processed = HashSet::new();
         let hint_pattern = format!("{}/*.{}", self.data_directory, BITCASK_HINT_EXTENSION);
         let data_pattern = format!("{}/*.{}", self.data_directory, BITCASK_DATA_EXTENSION);
+        let writing_pattern = format!("{}/*.{}", self.data_directory, BITCASK_WRITING_EXTENSION);
 
-        // First recover from the hint file. This is fast as it does not
-        // store the value significantly decreasing the number of bytes to read.
+        let mut files_to_delete: Vec<PathBuf> = vec![];
+
+        for writing_file_entry in glob(&*writing_pattern)? {
+
+        }
+
         for hint_file_entry in glob(&*hint_pattern)? {
-            match hint_file_entry {
-                Ok(hint_file) => {
-                    let sr_num = hint_file.file_name()
-                        .map(|os_str| os_str.to_str()).flatten()
-                        .map(|s| self.get_serial_number_from_filename(s)).flatten();
-                    match sr_num {
-                        Some(cur_serial_number) => {
-                            max_serial_number = max(max_serial_number, cur_serial_number);
-                            self.recover_from_hint_file(cur_serial_number, &hint_file)?;
-                            already_processed.insert(cur_serial_number);
-                        },
-                        None => { return Err(format_err!("invalid hint filename format for {}", hint_file.display())); }
-                    }
-                },
-                Err(e) => { return Err(e.into()); }
-            }
+            // register as hint file
         }
 
-        // Then recover from the data file. Skip if we have already read the corresponding
-        // hint file. This is the slow path. In the ideal case, most of the key-dir should
-        // have been built from the hint files.
         for data_file_entry in glob(&*data_pattern)? {
-            match data_file_entry {
-                Ok(data_file) => {
-                    let sr_num = data_file.file_name()
-                        .map(|os_str| os_str.to_str()).unwrap()
-                        .map(|s| self.get_serial_number_from_filename(s)).flatten();
-                    match sr_num {
-                        Some(cur_serial_number) => {
-                            if already_processed.contains(&cur_serial_number) {
-                                continue;
-                            }
-                            max_serial_number = max(max_serial_number, cur_serial_number);
-                            self.recover_from_data_file(cur_serial_number, &data_file)?;
-                            already_processed.insert(cur_serial_number);
-                        },
-                        None => { return Err(format_err!("invalid data filename format for {}", data_file.display())); }
-                    }
-                },
-                Err(e) => { return Err(e.into()); }
-            }
+            // register as data file
         }
 
-        // Now, open the current data file.
-        let next_serial_number = max_serial_number + 1;
-        let cur_open_data_filename = format!("{}.{}", next_serial_number, BITCASK_DATA_EXTENSION);
-        let cur_open_datafile = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(cur_open_data_filename)?;
+        for to_delete in files_to_delete.into_iter() {
 
-        self.current_serial_number = next_serial_number;
-        self.current_open_file = Some(cur_open_datafile);
+        }
+
         Ok(())
     }
 
@@ -287,7 +332,7 @@ impl BitcaskStore {
     /// Appends the command to the store. The command acts as a write-ahead logging
     /// system of the data store. The commands are written to the disk and are used
     /// to recover the state of the store on startup.
-    fn append_command_to_store(&mut self, key: &str, cmd: StoreCommand) -> Result<BitcaskPtr> {
+    fn append_command_to_store(&mut self, key: &str, cmd: BitcaskStoreCommand) -> Result<BitcaskPtr> {
         let cur_ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let key = bincode::serialize(key)?;
         let val = bincode::serialize(&cmd)?;
@@ -354,16 +399,81 @@ impl KVStore for BitcaskStore {
     }
 
     fn set(&mut self, key: Self::Key, value: Self::Value) -> Result<()> {
-        let set_cmd = StoreCommand::Set(value);
+        let set_cmd = BitcaskStoreCommand::Set(value);
         let bitcask_ptr = self.append_command_to_store(&key, set_cmd)?;
         self.update_key_directory(key, bitcask_ptr);
         Ok(())
     }
 
     fn remove(&mut self, key: Self::Key) -> Result<()> {
-        let remove_cmd = StoreCommand::Remove;
+        let remove_cmd = BitcaskStoreCommand::Remove;
         self.append_command_to_store(&key, remove_cmd)?;
         self.remove_entry_from_key_directory(key);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bitcask_file_identifier_test_suite {
+    use super::*;
+
+    #[test]
+    fn test_parse_correct_bitcask_datafile_identifier() {
+        let caskdata_identifier = "1.102093.caskdata";
+        let data_res = BitcaskFileIdentifier::try_from(caskdata_identifier);
+        assert_eq!(BitcaskFileIdentifier{
+            filetype: BitcaskFileType::Data,
+            serial_number: 1,
+            create_timestamp: 102093,
+        }, data_res.unwrap())
+    }
+
+    #[test]
+    fn test_parse_correct_bitcask_hintfile_identifier() {
+        let caskhint_identifier = "10.298979.caskhint";
+        let hint_res = BitcaskFileIdentifier::try_from(caskhint_identifier);
+        assert_eq!(BitcaskFileIdentifier{
+            filetype: BitcaskFileType::Hint,
+            serial_number: 10,
+            create_timestamp: 298979,
+        }, hint_res.unwrap())
+    }
+
+    #[test]
+    fn test_parse_correct_bitcask_writing_identifier() {
+        let caskwriting_identifier = "21.787977.caskwriting";
+        let writing_res = BitcaskFileIdentifier::try_from(caskwriting_identifier);
+        assert_eq!(BitcaskFileIdentifier{
+            filetype: BitcaskFileType::WriteInProgress,
+            serial_number: 21,
+            create_timestamp: 787977,
+        }, writing_res.unwrap());
+    }
+
+    #[test]
+    fn test_parse_incorrect_bitcask_file_identifier_more_than_3_parts() {
+        let identifier = "20.1989289.20.29798.caskdata";
+        let res = BitcaskFileIdentifier::try_from(identifier);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_parse_incorrect_bitcask_file_identifier_fewer_than_3_parts() {
+        let identifier = "20.caskdata";
+        let res = BitcaskFileIdentifier::try_from(identifier);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_parse_incorrect_bitcask_file_identifier_parts_cannot_be_parsed() {
+        let cases = vec![
+            ("a.787987.caskdata", "serial number is not integer"),
+            ("8768.ab.caskdata", "creation timestamp is not integer"),
+            ("9.97987.cask", "unrecognized cask extension"),
+        ];
+        for (identifier, msg_on_failure) in cases.into_iter() {
+            let res = BitcaskFileIdentifier::try_from(identifier);
+            assert!(res.is_err(), "{}", msg_on_failure);
+        }
     }
 }
