@@ -7,7 +7,9 @@
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
+use std::borrow::{Borrow, BorrowMut};
 use std::io::Write;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,6 +21,9 @@ use crate::error::Result;
 use crate::kv::KVStore;
 
 const X25: crc::Crc<u16> = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC);
+const BITCASK_HEADER_SIZE: u64 = 34;
+const BITCASK_DATA_EXTENSION: &'static str = "caskdata";
+const BITCASK_HINT_EXTENSION: &'static str = "caskhint";
 
 /// `StoreCommand` specifies the operation on a key.
 #[repr(C)]
@@ -28,16 +33,32 @@ enum StoreCommand {
     Remove,
 }
 
-/// `BitcaskEntry` represents a single entry in a bitcask data file.
-/// The entries are sorted by timestamp and the value depends on the
-/// command specified.
 #[repr(C, packed)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BitcaskEntry {
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct BitcaskHeader {
     crc: u16,
     ts: u128,
-    ksz: u64,
     vsz: u64,
+    ksz: u64,
+}
+
+/// `BitcaskEntry` represents a single entry in a bitcask data file.
+/// The entries are sorted by timestamp and the value depends on the
+/// command specified. The format is as follows
+/// +---------+---------+---------+---------+----------+----------+
+/// | crc(2B) | ts(16B) | ksz(8B) | vsz(8B) | key(ksz) | val(vsz) |
+/// +---------+---------+---------+---------+----------+----------+
+///
+/// Notice that until the `key` field, it is all fixed-size fields.
+/// Hence, given the start of the entry, we can read the whole entry
+/// with the following algorithm. Parse the first 34B which also gives
+/// us the key and the value size. We then read the `ksz` and `vsz`
+/// bytes and try to interpret it as UTF-8 to recover key and values.
+/// We then verify the entire output from `ts` all the way to the
+/// end of `val` with the given `crc` to check for corruption.
+#[derive(Serialize, Deserialize)]
+struct BitcaskEntry {
+    header: BitcaskHeader,
     key: String,
     value: StoreCommand,
 }
@@ -45,8 +66,7 @@ struct BitcaskEntry {
 /// `BitcaskHintEntry` represents a single entry in a bitcask hint file.
 /// The entries are sorted by timestamp and are there to aid quick recovery
 /// of the bitcask store after a restart.
-#[repr(C, packed)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct BitcaskHintEntry {
     ts: u128,
     ksz: u32,
@@ -109,8 +129,8 @@ impl BitcaskStore {
     fn recover_from_disk(&mut self) -> Result<()> {
         let mut max_serial_number = 0;
         let mut already_processed = HashSet::new();
-        let hint_pattern = format!("{}/*.caskdata", self.data_directory);
-        let data_pattern = format!("{}/*.caskhint", self.data_directory);
+        let hint_pattern = format!("{}/*.{}", self.data_directory, BITCASK_HINT_EXTENSION);
+        let data_pattern = format!("{}/*.{}", self.data_directory, BITCASK_DATA_EXTENSION);
 
         // First recover from the hint file. This is fast as it does not
         // store the value significantly decreasing the number of bytes to read.
@@ -160,7 +180,7 @@ impl BitcaskStore {
 
         // Now, open the current data file.
         let next_serial_number = max_serial_number + 1;
-        let cur_open_data_filename = format!("{}.caskdata", next_serial_number);
+        let cur_open_data_filename = format!("{}.{}", next_serial_number, BITCASK_DATA_EXTENSION);
         let cur_open_datafile = OpenOptions::new()
             .read(true)
             .write(true)
@@ -180,8 +200,32 @@ impl BitcaskStore {
         todo!()
     }
 
-    fn fetch_entry(&self, bitcask_ptr: BitcaskPtr) -> Result<BitcaskEntry> {
-        todo!()
+    fn fetch_value(&self, key: &str, bitcask_ptr: BitcaskPtr) -> Result<String> {
+        let ksz = bincode::serialized_size(key)?;
+        if bitcask_ptr.vpos < ksz + BITCASK_HEADER_SIZE {
+            return Err(format_err!("invalid bitcask_ptr: insufficient bytes for given key size"));
+        }
+        let entry_offset = bitcask_ptr.vpos - (ksz + BITCASK_HEADER_SIZE);
+        self.load_entry_from_datafile(bitcask_ptr.file_id, entry_offset)
+    }
+
+    fn load_entry_from_datafile(&self, file_id: u32, entry_offset: u64) -> Result<String> {
+        // TODO: cache file handles to avoid opening repeatedly
+        let datafile_name = format!("{}.{}", file_id, BITCASK_DATA_EXTENSION);
+        let mut file_handle = File::open(datafile_name)?;
+
+        let mut entry_header_bytes = [0_u8; BITCASK_HEADER_SIZE as usize];
+        file_handle.read_exact_at(entry_header_bytes.borrow_mut(), entry_offset)?;
+
+        let entry_header: BitcaskHeader = bincode::deserialize(entry_header_bytes.borrow())?;
+        let val_offset = entry_offset + BITCASK_HEADER_SIZE + entry_header.ksz;
+        let mut val_buffer = Vec::with_capacity(entry_header.vsz as usize);
+
+        file_handle.read_exact_at(val_buffer.as_mut(), val_offset)?;
+        match String::from_utf8(val_buffer) {
+            Ok(val) => Ok(val),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn append_command_to_store(&mut self, key: &str, cmd: StoreCommand) -> Result<BitcaskPtr> {
@@ -194,19 +238,19 @@ impl BitcaskStore {
         let val_size_bytes = (val.len() as u64).to_be_bytes();
 
         let mut digest = X25.digest();
-        digest.update(&*cur_ts_bytes);
-        digest.update(&*key_size_bytes);
-        digest.update(&*val_size_bytes);
+        digest.update(&cur_ts_bytes[..]);
+        digest.update(&key_size_bytes[..]);
+        digest.update(&val_size_bytes[..]);
         digest.update(key.as_ref());
         digest.update(val.as_ref());
         let crc = digest.finalize().to_be_bytes();
 
         let mut v_offset = 0;
         let mut cur_file = self.current_open_file.as_mut().unwrap();
-        v_offset += cur_file.write(&*crc)?;
-        v_offset += cur_file.write(&*cur_ts_bytes)?;
-        v_offset += cur_file.write(&*key_size_bytes)?;
-        v_offset += cur_file.write(&*val_size_bytes)?;
+        v_offset += cur_file.write(&crc[..])?;
+        v_offset += cur_file.write(&cur_ts_bytes[..])?;
+        v_offset += cur_file.write(&key_size_bytes[..])?;
+        v_offset += cur_file.write(&val_size_bytes[..])?;
         v_offset += cur_file.write(key.as_ref())?;
         cur_file.write_all(val.as_ref())?;
 
@@ -235,8 +279,8 @@ impl KVStore for BitcaskStore {
         let entry = self.key_dir.get(&key);
         match entry {
             Some(bitcask_ptr) => {
-                self.fetch_entry(*bitcask_ptr)
-                    .map(|bentry| bentry.get_value())
+                let fetch_res = self.fetch_value(&key, *bitcask_ptr)?;
+                Ok(Some(fetch_res))
             },
             None => Ok(None),
         }
