@@ -5,9 +5,10 @@
 #![deny(missing_docs)]
 
 use std::borrow::{Borrow, BorrowMut};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
+use std::fs;
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::mem::size_of;
@@ -31,7 +32,7 @@ const BITCASK_DATA_EXTENSION: &'static str = "caskdata";
 const BITCASK_HINT_EXTENSION: &'static str = "caskhint";
 const BITCASK_WRITING_EXTENSION: &'static str = "caskwriting";
 
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Copy, Clone)]
 enum BitcaskFileType {
     Data,
     Hint,
@@ -69,11 +70,11 @@ impl Display for BitcaskFileType {
 
 /// `BitcaskFileIdentifier` is the structured representation of a filename
 /// related to Bitcask.
-#[derive(Debug, Eq, PartialEq, Hash)]
+#[derive(Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Clone, Copy)]
 struct BitcaskFileIdentifier {
-    filetype: BitcaskFileType,
     serial_number: u32,
     create_timestamp: u128,
+    filetype: BitcaskFileType,
 }
 
 impl TryFrom<PathBuf> for BitcaskFileIdentifier {
@@ -88,6 +89,12 @@ impl TryFrom<PathBuf> for BitcaskFileIdentifier {
             .flatten()
             .ok_or(format_err!("cannot get filename"))?;
         Self::try_from(filename)
+    }
+}
+
+impl Into<PathBuf> for BitcaskFileIdentifier {
+    fn into(self) -> PathBuf {
+        format!("{}.{}.{}", self.serial_number, self.create_timestamp, self.filetype.extension()).into()
     }
 }
 
@@ -239,34 +246,72 @@ impl BitcaskStore {
         Ok(store)
     }
 
-    fn get_serial_number_from_filename(&self, filename: &str) -> Option<u32> {
-        todo!()
-    }
-
     fn recover_from_disk(&mut self) -> Result<()> {
-        let hint_pattern = format!("{}/*.{}", self.data_directory, BITCASK_HINT_EXTENSION);
         let data_pattern = format!("{}/*.{}", self.data_directory, BITCASK_DATA_EXTENSION);
         let writing_pattern = format!("{}/*.{}", self.data_directory, BITCASK_WRITING_EXTENSION);
 
-        let mut files_to_delete: Vec<PathBuf> = vec![];
-
-        for writing_file_entry in glob(&*writing_pattern)? {
-
-        }
-
-        for hint_file_entry in glob(&*hint_pattern)? {
-            // register as hint file
-        }
+        let mut data_files: BTreeSet<BitcaskFileIdentifier> = BTreeSet::new();
 
         for data_file_entry in glob(&*data_pattern)? {
-            // register as data file
+            let data_file_identifier = BitcaskFileIdentifier::try_from(data_file_entry?)?;
+            data_files.insert(data_file_identifier);
         }
 
-        for to_delete in files_to_delete.into_iter() {
-
+        for writing_file_entry in glob(&*writing_pattern)? {
+            let file_identifier = BitcaskFileIdentifier::try_from(writing_file_entry?)?;
+            let data_file_identifier = BitcaskFileIdentifier {
+                filetype: BitcaskFileType::Data,
+                serial_number: file_identifier.serial_number,
+                create_timestamp: file_identifier.create_timestamp,
+            };
+            data_files.remove(&data_file_identifier);
+            self.cleanup_bitcask_files(data_file_identifier)?;
         }
+
+        let mut largest_ts_per_serial_data: HashMap<u32, u128> = HashMap::new();
+        for file_id in data_files.iter() {
+            largest_ts_per_serial_data.entry(file_id.serial_number)
+                .and_modify(|v| { *v = std::cmp::max(file_id.create_timestamp, *v); })
+                .or_insert(file_id.create_timestamp);
+        }
+
+        data_files.retain(|&file_id| {
+            let max_ts = largest_ts_per_serial_data.get(&file_id.serial_number).cloned().unwrap();
+            debug_assert!(file_id.create_timestamp <= max_ts);
+            let should_retain_file = file_id.create_timestamp == max_ts;
+            if !should_retain_file {
+                let _ = self.cleanup_bitcask_files(file_id.clone());
+            }
+            should_retain_file
+        });
 
         Ok(())
+    }
+
+    fn cleanup_bitcask_files(&self, data_file: BitcaskFileIdentifier) -> Result<()> {
+        debug_assert!(data_file.filetype == BitcaskFileType::Data);
+        self.delete_file_if_exists(data_file)?;
+        self.delete_file_if_exists(BitcaskFileIdentifier{
+            serial_number: data_file.serial_number,
+            create_timestamp: data_file.create_timestamp,
+            filetype: BitcaskFileType::Hint,
+        })?;
+        self.delete_file_if_exists(BitcaskFileIdentifier{
+            serial_number: data_file.serial_number,
+            create_timestamp: data_file.create_timestamp,
+            filetype: BitcaskFileType::WriteInProgress,
+        })?;
+        Ok(())
+    }
+
+    fn delete_file_if_exists(&self, file_id: BitcaskFileIdentifier) -> Result<()> {
+        let p: PathBuf = file_id.into();
+        match fs::remove_file(p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(Error::from(e));
+            }
+            _ => { Ok(()) },
+        }
     }
 
     fn recover_from_hint_file(&mut self, hint_file_id: u32, path: &PathBuf) -> Result<()> {
