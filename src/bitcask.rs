@@ -15,7 +15,7 @@ use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use bincode::config::BigEndian;
+
 use failure::{Error, format_err};
 use glob::glob;
 use serde_derive::{Deserialize, Serialize};
