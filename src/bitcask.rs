@@ -9,13 +9,13 @@ use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fmt::{Display, Formatter};
 use std::fs;
-use std::fs::File;
+use std::fs::{File, read};
 use std::io::{Cursor, Read, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-
+use bincode::config::BigEndian;
 use failure::{Error, format_err};
 use glob::glob;
 use serde_derive::{Deserialize, Serialize};
@@ -284,24 +284,83 @@ impl BitcaskStore {
             }
             should_retain_file
         });
+        
+        for data_file in data_files.into_iter() {
+            self.recover_from_single_data_file(data_file)?;
+        }
 
         Ok(())
+    }
+
+    fn recover_from_single_data_file(&mut self, data_file: BitcaskFileIdentifier) -> Result<()> {
+        let recovered_from_hint_file = self.try_recover_from_hint_file(&data_file)?;
+        if recovered_from_hint_file {
+            return Ok(());
+        }
+        self.do_recover_from_data_file(data_file)
+    }
+
+    fn do_recover_from_data_file(&mut self, data_file: BitcaskFileIdentifier) -> Result<()> {
+        let contents = read::<PathBuf>(data_file.into())?;
+        let mut cursor = Cursor::new(&contents);
+        while cursor.position() < contents.len() as u64 {
+            let (bitcask_header, bitcask_key, vpos) = BitcaskEntry::parse_keydir_entry(&mut cursor)?;
+            let bitcask_ptr = BitcaskPtr{
+                file_id: data_file.serial_number,
+                vsz: bitcask_header.vsz,
+                ts: bitcask_header.ts,
+                vpos,
+            };
+            self.update_key_directory(bitcask_key, bitcask_ptr)
+        }
+        Ok(())
+    }
+
+    fn try_recover_from_hint_file(&mut self, data_file: &BitcaskFileIdentifier) -> Result<bool> {
+        let hint_file = self.get_hint_file_for_data_file(&data_file);
+        let contents_res = read::<PathBuf>(hint_file.into());
+        match contents_res {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::from(e)),
+            Ok(contents) => {
+                let mut cursor = Cursor::new(&contents);
+                while cursor.position() < contents.len() as u64 {
+                    let bitcask_hint = BitcaskHintEntry::parse_from(&mut cursor)?;
+                    let bitcask_ptr = BitcaskPtr{
+                        file_id: hint_file.serial_number,
+                        vsz: bitcask_hint.header.vsz,
+                        vpos: bitcask_hint.header.vpos,
+                        ts: bitcask_hint.header.ts,
+                    };
+                    self.update_key_directory(bitcask_hint.key, bitcask_ptr);
+                }
+                Ok(true)
+            }
+        }
     }
 
     fn cleanup_bitcask_files(&self, data_file: BitcaskFileIdentifier) -> Result<()> {
         debug_assert!(data_file.filetype == BitcaskFileType::Data);
         self.delete_file_if_exists(data_file)?;
-        self.delete_file_if_exists(BitcaskFileIdentifier{
+        self.delete_file_if_exists(self.get_hint_file_for_data_file(&data_file))?;
+        self.delete_file_if_exists(self.get_write_in_progress_file_for_data_file(&data_file))?;
+        Ok(())
+    }
+    
+    fn get_hint_file_for_data_file(&self, data_file: &BitcaskFileIdentifier) -> BitcaskFileIdentifier {
+        BitcaskFileIdentifier {
             serial_number: data_file.serial_number,
             create_timestamp: data_file.create_timestamp,
             filetype: BitcaskFileType::Hint,
-        })?;
-        self.delete_file_if_exists(BitcaskFileIdentifier{
+        }
+    }
+
+    fn get_write_in_progress_file_for_data_file(&self, data_file: &BitcaskFileIdentifier) -> BitcaskFileIdentifier {
+        BitcaskFileIdentifier {
             serial_number: data_file.serial_number,
             create_timestamp: data_file.create_timestamp,
             filetype: BitcaskFileType::WriteInProgress,
-        })?;
-        Ok(())
+        }
     }
 
     fn delete_file_if_exists(&self, file_id: BitcaskFileIdentifier) -> Result<()> {
@@ -314,24 +373,8 @@ impl BitcaskStore {
         }
     }
 
-    fn recover_from_hint_file(&mut self, hint_file_id: u32, path: &PathBuf) -> Result<()> {
-        let contents = std::fs::read(path)?;
-        let mut cursor = Cursor::new(&contents);
-        while cursor.position() < contents.len() as u64 {
-            let bitcask_hint = BitcaskHintEntry::parse_from(&mut cursor)?;
-            let bitcask_ptr = BitcaskPtr{
-                file_id: hint_file_id,
-                vsz: bitcask_hint.header.vsz,
-                vpos: bitcask_hint.header.vpos,
-                ts: bitcask_hint.header.ts,
-            };
-            self.update_key_directory(bitcask_hint.key, bitcask_ptr);
-        }
-        Ok(())
-    }
-
     fn recover_from_data_file(&mut self, data_file_id: u32, path: &PathBuf) -> Result<()> {
-        let contents = std::fs::read(path)?;
+        let contents = read(path)?;
         let mut cursor = Cursor::new(&contents);
         while cursor.position() < contents.len() as u64 {
             let (bitcask_header, bitcask_key, vpos) = BitcaskEntry::parse_keydir_entry(&mut cursor)?;
