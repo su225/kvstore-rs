@@ -225,6 +225,7 @@ pub struct BitcaskStore {
     current_open_file: Option<File>,
     current_serial_number: u32,
     key_dir: HashMap<String, BitcaskPtr>,
+    largest_ts_per_serial_data: HashMap<u32, u128>,
 }
 
 impl BitcaskStore {
@@ -238,6 +239,7 @@ impl BitcaskStore {
             current_open_file: None,
             current_serial_number: 0,
             key_dir: HashMap::new(),
+            largest_ts_per_serial_data: HashMap::new(),
         };
         store.recover_from_disk()?;
         if store.current_open_file.is_none() {
@@ -268,15 +270,15 @@ impl BitcaskStore {
             self.cleanup_bitcask_files(data_file_identifier)?;
         }
 
-        let mut largest_ts_per_serial_data: HashMap<u32, u128> = HashMap::new();
+        self.largest_ts_per_serial_data = HashMap::new();
         for file_id in data_files.iter() {
-            largest_ts_per_serial_data.entry(file_id.serial_number)
+            self.largest_ts_per_serial_data.entry(file_id.serial_number)
                 .and_modify(|v| { *v = std::cmp::max(file_id.create_timestamp, *v); })
                 .or_insert(file_id.create_timestamp);
         }
 
         data_files.retain(|&file_id| {
-            let max_ts = largest_ts_per_serial_data.get(&file_id.serial_number).cloned().unwrap();
+            let max_ts = self.largest_ts_per_serial_data.get(&file_id.serial_number).cloned().unwrap();
             debug_assert!(file_id.create_timestamp <= max_ts);
             let should_retain_file = file_id.create_timestamp == max_ts;
             if !should_retain_file {
