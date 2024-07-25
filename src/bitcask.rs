@@ -136,6 +136,15 @@ struct BitcaskHeader {
     ksz: u64,
 }
 
+impl BitcaskHeader {
+    fn parse_from(cursor: &mut Cursor<impl AsRef<[u8]>>) -> Result<BitcaskHeader> {
+        let mut entry_header = [0_u8; BITCASK_HEADER_SIZE as usize];
+        cursor.read_exact(&mut entry_header[..])?;
+        let header: BitcaskHeader = bincode::deserialize(&entry_header[..])?;
+        Ok(header)
+    }
+}
+
 /// `BitcaskEntry` represents a single entry in a bitcask data file.
 /// The entries are sorted by timestamp and the value depends on the
 /// command specified. The format is as follows
@@ -159,8 +168,16 @@ struct BitcaskEntry {
 }
 
 impl BitcaskEntry {
-    fn parse_keydir_entry(cursor: &mut Cursor<impl AsRef<[u8]>>) -> Result<(BitcaskHeader, String, u64)> {
-        todo!()
+    /// `parse_key_dir_entry` parses a key directory entry from the hint or the data
+    /// file and returns the necessary data for the key directory to be built.
+    fn parse_key_dir_entry(cursor: &mut Cursor<impl AsRef<[u8]>>) -> Result<(BitcaskHeader, String, u64)> {
+        let header = BitcaskHeader::parse_from(cursor)?;
+        let mut key_buffer = Vec::with_capacity(header.ksz as usize);
+        cursor.read_exact(&mut key_buffer[..])?;
+
+        let key = String::from_utf8(key_buffer).map_err(|e| Error::from(e))?;
+        let value_pos = cursor.position();
+        Ok((header, key, value_pos))
     }
 
     fn get_value(&self) -> Option<String> {
@@ -248,6 +265,9 @@ impl BitcaskStore {
         Ok(store)
     }
 
+    /// `recover_from_disk` reads the bitcask data and hint files and recovers the
+    /// in-memory key directory structure. It also cleans up any file that should
+    /// have been cleaned up, but was not done so due to whatever reason.
     fn recover_from_disk(&mut self) -> Result<()> {
         let data_pattern = format!("{}/*.{}", self.data_directory, BITCASK_DATA_EXTENSION);
         let writing_pattern = format!("{}/*.{}", self.data_directory, BITCASK_WRITING_EXTENSION);
@@ -302,22 +322,6 @@ impl BitcaskStore {
         self.do_recover_from_data_file(data_file)
     }
 
-    fn do_recover_from_data_file(&mut self, data_file: BitcaskFileIdentifier) -> Result<()> {
-        let contents = read::<PathBuf>(data_file.into())?;
-        let mut cursor = Cursor::new(&contents);
-        while cursor.position() < contents.len() as u64 {
-            let (bitcask_header, bitcask_key, vpos) = BitcaskEntry::parse_keydir_entry(&mut cursor)?;
-            let bitcask_ptr = BitcaskPtr{
-                file_id: data_file.serial_number,
-                vsz: bitcask_header.vsz,
-                ts: bitcask_header.ts,
-                vpos,
-            };
-            self.update_key_directory(bitcask_key, bitcask_ptr)
-        }
-        Ok(())
-    }
-
     fn try_recover_from_hint_file(&mut self, data_file: &BitcaskFileIdentifier) -> Result<bool> {
         let hint_file = self.get_hint_file_for_data_file(&data_file);
         let contents_res = read::<PathBuf>(hint_file.into());
@@ -339,6 +343,22 @@ impl BitcaskStore {
                 Ok(true)
             }
         }
+    }
+
+    fn do_recover_from_data_file(&mut self, data_file: BitcaskFileIdentifier) -> Result<()> {
+        let contents = read::<PathBuf>(data_file.into())?;
+        let mut cursor = Cursor::new(&contents);
+        while cursor.position() < contents.len() as u64 {
+            let (bitcask_header, bitcask_key, vpos) = BitcaskEntry::parse_key_dir_entry(&mut cursor)?;
+            let bitcask_ptr = BitcaskPtr{
+                file_id: data_file.serial_number,
+                vsz: bitcask_header.vsz,
+                ts: bitcask_header.ts,
+                vpos,
+            };
+            self.update_key_directory(bitcask_key, bitcask_ptr)
+        }
+        Ok(())
     }
 
     fn cleanup_bitcask_files(&self, data_file: BitcaskFileIdentifier) -> Result<()> {
@@ -373,22 +393,6 @@ impl BitcaskStore {
             }
             _ => { Ok(()) },
         }
-    }
-
-    fn recover_from_data_file(&mut self, data_file_id: u32, path: &PathBuf) -> Result<()> {
-        let contents = read(path)?;
-        let mut cursor = Cursor::new(&contents);
-        while cursor.position() < contents.len() as u64 {
-            let (bitcask_header, bitcask_key, vpos) = BitcaskEntry::parse_keydir_entry(&mut cursor)?;
-            let bitcask_ptr = BitcaskPtr{
-                file_id: data_file_id,
-                vsz: bitcask_header.vsz,
-                ts: bitcask_header.ts,
-                vpos,
-            };
-            self.update_key_directory(bitcask_key, bitcask_ptr)
-        }
-        Ok(())
     }
 
     fn fetch_value(&self, key: &str, bitcask_ptr: BitcaskPtr) -> Result<String> {
