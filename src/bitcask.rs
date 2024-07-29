@@ -274,11 +274,20 @@ impl BitcaskStore {
 
         let mut data_files: BTreeSet<BitcaskFileIdentifier> = BTreeSet::new();
 
+        // First, list all the data files to read from the directory. This
+        // includes all the data files that were still being written at the
+        // time the process was stopped (or a crash).
         for data_file_entry in glob(&*data_pattern)? {
             let data_file_identifier = BitcaskFileIdentifier::try_from(data_file_entry?)?;
             data_files.insert(data_file_identifier);
         }
 
+        // The data files that are being written have an indicator. So look
+        // for all the "in-progress" files and remove the corresponding data
+        // files. The half-baked data files and their corresponding hint files
+        // will be removed from the data directory. The in-progress files would
+        // be written only by the merger which combines several data files into
+        // one for compaction (assuming it can be done)
         for writing_file_entry in glob(&*writing_pattern)? {
             let file_identifier = BitcaskFileIdentifier::try_from(writing_file_entry?)?;
             let data_file_identifier = BitcaskFileIdentifier {
@@ -290,6 +299,10 @@ impl BitcaskStore {
             self.cleanup_bitcask_files(data_file_identifier)?;
         }
 
+        // It is possible that even after successful merging, the old versions of
+        // the data files are still present. They should not be used anymore. So
+        // we can reclaim some space by deleting them from the data directory. To
+        // do that, we need to find out the latest timestamp for each serial number.
         self.largest_ts_per_serial_data = HashMap::new();
         for file_id in data_files.iter() {
             self.largest_ts_per_serial_data.entry(file_id.serial_number)
@@ -297,6 +310,9 @@ impl BitcaskStore {
                 .or_insert(file_id.create_timestamp);
         }
 
+        // Now run the garbage collection to remove all the files. We can speed up
+        // the recovery by moving this to the background. Measure the time taken
+        // and decide accordingly. But not make it work!
         data_files.retain(|&file_id| {
             let max_ts = self.largest_ts_per_serial_data.get(&file_id.serial_number).cloned().unwrap();
             debug_assert!(file_id.create_timestamp <= max_ts);
@@ -306,7 +322,10 @@ impl BitcaskStore {
             }
             should_retain_file
         });
-        
+
+        // We now have the final set of data files after removing the stale files and
+        // the in-progress or half-baked files. So read from the rest to recover the
+        // state of the "key directory" for the shard.
         for data_file in data_files.into_iter() {
             self.recover_from_single_data_file(data_file)?;
         }
@@ -314,6 +333,10 @@ impl BitcaskStore {
         Ok(())
     }
 
+    /// `recover_from_single_data_file` recovers the key directory entries from a single
+    /// bitcask file. It first tries to read it from a hint file because it is much faster
+    /// as hint files don't store value. If a hint-file is not present, then it recovers
+    /// from the data file. Note that the value is still not read.
     fn recover_from_single_data_file(&mut self, data_file: BitcaskFileIdentifier) -> Result<()> {
         let recovered_from_hint_file = self.try_recover_from_hint_file(&data_file)?;
         if recovered_from_hint_file {
@@ -322,6 +345,9 @@ impl BitcaskStore {
         self.do_recover_from_data_file(data_file)
     }
 
+    /// `try_recover_from_hint_file` tries to recover from the hint file for the corresponding
+    /// bitcask data file if it exists. If the hint file does not exist, then it returns `Ok(false)`.
+    /// If the recovery is successful, then it returns `Ok(true)`. Otherwise, it returns an error.
     fn try_recover_from_hint_file(&mut self, data_file: &BitcaskFileIdentifier) -> Result<bool> {
         let hint_file = self.get_hint_file_for_data_file(&data_file);
         let contents_res = read::<PathBuf>(hint_file.into());
@@ -345,6 +371,7 @@ impl BitcaskStore {
         }
     }
 
+    /// `do_recover_from_data_file` does the actual work of recovering from the data file.
     fn do_recover_from_data_file(&mut self, data_file: BitcaskFileIdentifier) -> Result<()> {
         let contents = read::<PathBuf>(data_file.into())?;
         let mut cursor = Cursor::new(&contents);
