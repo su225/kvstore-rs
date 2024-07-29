@@ -14,6 +14,7 @@ use std::io::{Cursor, Read, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use failure::{Error, format_err};
@@ -273,12 +274,14 @@ impl BitcaskStore {
         let writing_pattern = format!("{}/*.{}", self.data_directory, BITCASK_WRITING_EXTENSION);
 
         let mut data_files: BTreeSet<BitcaskFileIdentifier> = BTreeSet::new();
+        let mut largest_serial_number = 0;
 
         // First, list all the data files to read from the directory. This
         // includes all the data files that were still being written at the
         // time the process was stopped (or a crash).
         for data_file_entry in glob(&*data_pattern)? {
             let data_file_identifier = BitcaskFileIdentifier::try_from(data_file_entry?)?;
+            largest_serial_number = std::cmp::max(largest_serial_number, data_file_identifier.serial_number);
             data_files.insert(data_file_identifier);
         }
 
@@ -330,6 +333,26 @@ impl BitcaskStore {
             self.recover_from_single_data_file(data_file)?;
         }
 
+        // Finally open a new data file which is the latest one and set it as the current
+        // data file. No matter how small the previous file was, just mark it ended and
+        // let it go. In the background, we can create the hint files or merge it for
+        // faster recovery.
+        let current_serial_number = largest_serial_number + 1;
+        self.create_bitcask_datafile(current_serial_number)?;
+
+        Ok(())
+    }
+
+    fn create_bitcask_datafile(&mut self, serial_number: u32) -> Result<()> {
+        let current_ts = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        let identifier = BitcaskFileIdentifier{
+            serial_number,
+            create_timestamp: current_ts,
+            filetype: BitcaskFileType::Data,
+        };
+        let path = PathBuf::from(&self.data_directory).join::<PathBuf>(identifier.into());
+        let file_handle = File::create_new::<PathBuf>(path)?;
+        self.current_open_file = Some(file_handle);
         Ok(())
     }
 
@@ -350,7 +373,7 @@ impl BitcaskStore {
     /// If the recovery is successful, then it returns `Ok(true)`. Otherwise, it returns an error.
     fn try_recover_from_hint_file(&mut self, data_file: &BitcaskFileIdentifier) -> Result<bool> {
         let hint_file = self.get_hint_file_for_data_file(&data_file);
-        let contents_res = read::<PathBuf>(hint_file.into());
+        let contents_res = read::<PathBuf>(self.bitcask_file_path(hint_file)?);
         match contents_res {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(Error::from(e)),
@@ -373,7 +396,7 @@ impl BitcaskStore {
 
     /// `do_recover_from_data_file` does the actual work of recovering from the data file.
     fn do_recover_from_data_file(&mut self, data_file: BitcaskFileIdentifier) -> Result<()> {
-        let contents = read::<PathBuf>(data_file.into())?;
+        let contents = read::<PathBuf>(self.bitcask_file_path(data_file)?)?;
         let mut cursor = Cursor::new(&contents);
         while cursor.position() < contents.len() as u64 {
             let (bitcask_header, bitcask_key, vpos) = BitcaskEntry::parse_key_dir_entry(&mut cursor)?;
@@ -502,6 +525,11 @@ impl BitcaskStore {
     fn remove_entry_from_key_directory(&mut self, key: String) {
         self.key_dir.remove(&key);
     }
+
+    fn bitcask_file_path(&self, bitcask_file_identifier: BitcaskFileIdentifier) -> Result<PathBuf> {
+        Ok(PathBuf::from_str(self.data_directory.as_str())?
+            .join::<PathBuf>(bitcask_file_identifier.into()))
+    }
 }
 
 impl KVStore for BitcaskStore {
@@ -595,6 +623,48 @@ mod bitcask_file_identifier_test_suite {
         for (identifier, msg_on_failure) in cases.into_iter() {
             let res = BitcaskFileIdentifier::try_from(identifier);
             assert!(res.is_err(), "{}", msg_on_failure);
+        }
+    }
+}
+
+#[cfg(test)]
+mod bitcask_integration_test {
+    use std::env;
+
+    use super::*;
+
+    // The test has the following steps
+    // 1. Opens a directory as bitcask data directory.
+    // 2. Creates/Updates/Deletes some bitcask entries.
+    // 3. Drops the bitcask store simulating the close.
+    // 4. Re-creates the bitcask store and checks for recovery.
+    #[test]
+    fn test_open_bitcask_write_some_data_and_recover() {
+        let datatmp_path = env::current_dir().unwrap().join("datatmp");
+        let cur_time_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let temp_dir_path = datatmp_path.join(format!("test_{}", cur_time_nanos.as_nanos()));
+        fs::create_dir(&temp_dir_path).unwrap();
+        {
+            let mut store: BitcaskStore = BitcaskStore::open(temp_dir_path.as_path()).unwrap();
+            store.set("foo".to_string(), "bar".to_string()).unwrap();
+            store.set("fuu".to_string(), "ber".to_string()).unwrap();
+            store.set("bad".to_string(), "key".to_string()).unwrap();
+            store.remove("bad".to_string()).unwrap();
+            store.set("fuu".to_string(), "bur".to_string()).unwrap();
+        }
+        {
+            let store: BitcaskStore = BitcaskStore::open(temp_dir_path.as_path()).unwrap();
+            assert_eq!(store.get("foo".to_string()).unwrap(), Some("bar".to_string()));
+            assert_eq!(store.get("fuu".to_string()).unwrap(), Some("bur".to_string()));
+            assert!(store.get("bad".to_string()).unwrap().is_none());
+            assert!(store.get("jaz".to_string()).unwrap().is_none());
+        }
+    }
+
+    fn assert_bitcask_file_present(data_directory: String, serial_number: u32, file_type: BitcaskFileType) {
+        let pattern = format!("{}/{}.*.{}", data_directory, serial_number, file_type.extension());
+        for f in glob(pattern.as_str()).unwrap() {
+
         }
     }
 }

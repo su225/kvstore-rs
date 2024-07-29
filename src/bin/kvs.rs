@@ -1,7 +1,15 @@
-use clap::{arg, Command};
 use std::process::exit;
 
+use clap::{arg, Command};
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
 fn main() {
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .init();
+
     let matches = Command::new("kvstore-rs")
         .version(env!("CARGO_PKG_VERSION"))
         .author(env!("CARGO_PKG_AUTHORS"))
